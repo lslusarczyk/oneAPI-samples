@@ -319,6 +319,74 @@ catch (sycl::exception const &exc) {
   exit(0);
 }
 
+void pureSycl(float *inputVec_h, float *inputVec_d,
+              double *outputVec_d, double *result_d,
+              size_t inputSize, size_t numOfBlocks) try {
+
+  double result_h = 0.0;
+
+  sycl::queue q = sycl::queue{sycl::default_selector_v,
+    {sycl::ext::intel::property::queue::no_immediate_command_list()}};
+
+  if(!q.get_device().has(sycl::aspect::fp64)){
+      printf("Double precision isn't supported : %s \nExit\n",
+        q.get_device().get_info<sycl::info::device::name>().c_str());
+      exit(0);
+  }
+
+  for (int i = 0; i < GRAPH_LAUNCH_ITERATIONS; i++)
+  {
+    sycl::event ememcpy = q.memcpy(inputVec_d, inputVec_h, sizeof(float) * inputSize);
+    sycl::event ememset = q.fill(outputVec_d, 0, numOfBlocks);
+    sycl::event ememset1 = q.fill(result_d, 0, 1);
+
+    sycl::event ek1 = q.submit([&](sycl::handler &cgh) {
+      cgh.depends_on({ememcpy, ememset});
+      sycl::local_accessor<double, 1> tmp_acc_ct1(
+        sycl::range<1>(THREADS_PER_BLOCK), cgh);
+
+      cgh.parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, numOfBlocks) *
+                              sycl::range<3>(1, 1, THREADS_PER_BLOCK),
+                          sycl::range<3>(1, 1, THREADS_PER_BLOCK)),
+        [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(32)]] {
+          reduce(inputVec_d, outputVec_d, inputSize, numOfBlocks, item_ct1,
+                 tmp_acc_ct1.get_multi_ptr<sycl::access::decorated::no>()
+                                     .get());
+        });
+    });
+
+    sycl::event ek2 = q.submit([&](sycl::handler &cgh) {
+      cgh.depends_on({ek1, ememset1});
+      sycl::local_accessor<double, 1> tmp_acc_ct1(
+        sycl::range<1>(THREADS_PER_BLOCK), cgh);
+
+      cgh.parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, THREADS_PER_BLOCK),
+                          sycl::range<3>(1, 1, THREADS_PER_BLOCK)),
+        [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(32)]] {
+          reduceFinal(outputVec_d, result_d, numOfBlocks, item_ct1,
+                      tmp_acc_ct1.get_multi_ptr<sycl::access::decorated::no>()
+                                     .get());
+        });
+    });
+
+    q.submit([&](sycl::handler &cgh) {
+        cgh.depends_on(ek2);
+        cgh.memcpy(&result_h, result_d, sizeof(double));
+    }).wait();
+
+    printf("Final reduced sum = %lf\n", result_h);
+  }
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at :" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::cerr << "Exiting..." << std::endl;
+  exit(0);
+}
+
+
 int main(int argc, char **argv) {
   size_t size = 1 << 24;  // number of elements to reduce
   size_t maxBlocks = 512;
@@ -354,6 +422,14 @@ int main(int argc, char **argv) {
   auto Timer_duration2 =
       std::chrono::duration_cast<float_ms>(stopTimer2 - startTimer2).count();
   printf("Elapsed Time SYCL Streamcapture : %f (ms)\n", Timer_duration2);
+
+  auto startTimer3 = Time::now();
+  syclGraphCaptureQueue(inputVec_h, inputVec_d, outputVec_d, result_d,
+                               size, maxBlocks);
+  auto stopTimer3 = Time::now();
+  auto Timer_duration3 =
+      std::chrono::duration_cast<float_ms>(stopTimer3 - startTimer3).count();
+  printf("Elapsed Time pure SYCL : %f (ms)\n", Timer_duration3);
 
   sycl::free(inputVec_d, dpct::get_default_queue());
   sycl::free(outputVec_d, dpct::get_default_queue());
